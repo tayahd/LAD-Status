@@ -1,0 +1,20 @@
+{
+  "name": "LAD Status",
+  "short_name": "LAD Status",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#0b0d12",
+  "theme_color": "#0b0d12",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    },
+    {
+      "src": "icon-180.png",
+      "sizes": "180x180",
+      "type": "image/png"
+    }
+  ]
+}

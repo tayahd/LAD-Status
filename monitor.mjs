@@ -1,0 +1,219 @@
+// LAD uptime checker. Runs every 5 minutes (GitHub Actions cron), probes each
+// service, updates status.json, and sends a push through ntfy when something goes
+// down or comes back up. Based on the Pulse status monitor.
+//
+// Env (set in the repo's Settings, Secrets and variables, Actions):
+//   SITE_URL                  variable: LAD's address, like https://lad-tay.vercel.app/
+//   SUPABASE_URL              variable: LAD's Supabase Project URL
+//   SUPABASE_PUBLISHABLE_KEY  secret: LAD's publishable key (sb_publishable_...)
+//   VERCEL_BYPASS             secret, optional: Vercel "Protection Bypass for Automation"
+//                             secret, so the website check can see the real app behind
+//                             Vercel Authentication. Without it the check only proves
+//                             Vercel is answering.
+//   NTFY_TOPIC                secret: ntfy topic to push to (no topic = no pushes)
+//   NTFY_SERVER               default https://ntfy.sh
+//   DASHBOARD_URL             link opened when you tap a notification
+//   STATE_FILE                path to status.json (default ./status.json)
+//
+// `node monitor.mjs --test-notify` sends a test push and exits.
+
+import { readFile, writeFile } from 'node:fs/promises';
+
+const env = process.env;
+const STATE_FILE = env.STATE_FILE || './status.json';
+const SITE_URL = (env.SITE_URL || '').trim();
+const SB = (env.SUPABASE_URL || '').trim().replace(/\/$/, '');
+const KEY = (env.SUPABASE_PUBLISHABLE_KEY || env.SUPABASE_ANON_KEY || '').trim();
+const BYPASS = (env.VERCEL_BYPASS || '').trim();
+const NTFY_SERVER = (env.NTFY_SERVER || 'https://ntfy.sh').replace(/\/$/, '');
+const NTFY_TOPIC = env.NTFY_TOPIC || '';
+const DASHBOARD_URL = env.DASHBOARD_URL || '';
+
+const TIMEOUT_MS = 15000;
+const SLOW_MS = 4000;         // ok but slower than this = degraded
+const RETRY_DELAY_MS = Number(env.RETRY_DELAY_MS ?? 15000); // confirm a failure before calling it down
+const RECENT_MAX = 288;       // 24h of 5-minute checks
+const DAILY_DAYS = 90;
+const INCIDENTS_MAX = 100;
+
+// New Supabase keys (sb_publishable_...) go in the apikey header only; older JWT anon keys also go in Authorization.
+const sbHeaders = !KEY ? {} : KEY.startsWith('eyJ') ? { apikey: KEY, Authorization: `Bearer ${KEY}` } : { apikey: KEY };
+
+const SERVICES = [
+  SITE_URL && {
+    id: 'web', name: 'Website', group: 'Vercel', url: SITE_URL, redirect: 'manual',
+    headers: BYPASS ? { 'x-vercel-protection-bypass': BYPASS } : {},
+    validate: (res, body) => {
+      if (res.ok) return body.includes('id="root"') ? null : `HTTP ${res.status} (app shell missing)`;
+      // Vercel Authentication answering for a signed-out visitor still proves the site is being served.
+      const protectedResponse = res.status === 401 || (res.status >= 300 && res.status < 400 && /vercel\.com/i.test(res.headers.get('location') || ''));
+      if (protectedResponse && !BYPASS) return null;
+      if (protectedResponse) return `HTTP ${res.status} (Vercel protection blocked the check: is VERCEL_BYPASS still valid?)`;
+      return `HTTP ${res.status}`;
+    },
+  },
+  SB && KEY && {
+    id: 'auth', name: 'Sign-in', group: 'Supabase Auth', url: `${SB}/auth/v1/health`, headers: sbHeaders, supabase: true,
+  },
+  SB && KEY && {
+    // Signed-out visitors must be refused (0001_hub_items.sql revokes access), so "permission denied"
+    // is the healthy answer: it proves the database responded and is still locked.
+    id: 'db', name: 'Database', group: 'Supabase REST', url: `${SB}/rest/v1/items?select=id&limit=1`, headers: sbHeaders, supabase: true,
+    validate: (res, body) => {
+      if ((res.status === 401 || res.status === 403) && body.includes('42501')) return null;
+      if (res.ok) return 'Signed-out visitors can query the items table. Run supabase/0001_hub_items.sql again in the SQL Editor';
+      if (res.status === 404 || body.includes('PGRST205')) return 'The items table is missing. Run supabase/0001_hub_items.sql in the SQL Editor';
+      return `HTTP ${res.status}`;
+    },
+  },
+].filter(Boolean);
+
+const UP = 0, DEGRADED = 1, DOWN = 2;
+const LABEL = ['up', 'degraded', 'down'];
+
+async function probe(svc) {
+  const started = performance.now();
+  try {
+    const res = await fetch(svc.url, {
+      method: svc.method || 'GET',
+      headers: { 'User-Agent': 'lad-status-monitor', ...svc.headers },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+      redirect: svc.redirect || 'follow',
+    });
+    const body = await res.text();
+    const ms = Math.round(performance.now() - started);
+    const error = svc.validate ? svc.validate(res, body) : (res.ok ? null : `HTTP ${res.status}`);
+    if (error) return { s: DOWN, ms, code: res.status, error };
+    return { s: ms > SLOW_MS ? DEGRADED : UP, ms, code: res.status, error: null };
+  } catch (e) {
+    const ms = Math.round(performance.now() - started);
+    const error = e.name === 'TimeoutError' ? `Timed out after ${TIMEOUT_MS / 1000}s` : (e.cause?.code || e.message);
+    return { s: DOWN, ms, code: 0, error };
+  }
+}
+
+async function check(svc) {
+  const first = await probe(svc);
+  if (first.s !== DOWN) return first;
+  await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+  return probe(svc);
+}
+
+function fmtDuration(ms) {
+  const m = Math.round(ms / 60000);
+  if (m < 1) return 'under a minute';
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
+async function notify({ title, message, priority = 3, tags = [] }) {
+  if (!NTFY_TOPIC) {
+    console.log(`[no NTFY_TOPIC] would push: ${title} — ${message}`);
+    return;
+  }
+  const res = await fetch(NTFY_SERVER, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      topic: NTFY_TOPIC, title, message, priority, tags,
+      ...(DASHBOARD_URL ? { click: DASHBOARD_URL } : {}),
+    }),
+  });
+  if (!res.ok) console.error(`ntfy push failed: HTTP ${res.status} ${await res.text()}`);
+  else console.log(`pushed: ${title}`);
+}
+
+async function loadState() {
+  try {
+    return JSON.parse(await readFile(STATE_FILE, 'utf8'));
+  } catch {
+    return { services: {}, incidents: [] };
+  }
+}
+
+async function main() {
+  if (process.argv.includes('--test-notify')) {
+    await notify({ title: 'LAD Status test', message: 'Push notifications are working.', tags: ['bell'] });
+    return;
+  }
+
+  const missing = [!SITE_URL && 'SITE_URL', !SB && 'SUPABASE_URL', !KEY && 'SUPABASE_PUBLISHABLE_KEY'].filter(Boolean);
+  if (missing.length) console.warn(`Not set, so those checks are skipped: ${missing.join(', ')}`);
+  if (!SERVICES.length) { console.error('Nothing to check. Set SITE_URL, SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY.'); process.exit(1); }
+
+  const state = await loadState();
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const today = nowIso.slice(0, 10);
+  const results = await Promise.all(SERVICES.map(check));
+  const alerts = [];
+
+  SERVICES.forEach((svc, i) => {
+    const r = results[i];
+    const prev = state.services[svc.id] || { status: 'up', since: nowIso, recent: [], daily: {} };
+    const prevDown = prev.status === 'down';
+    const isDown = r.s === DOWN;
+    const status = LABEL[r.s];
+
+    if (isDown && !prevDown) {
+      state.incidents.unshift({ service: svc.id, name: svc.name, start: nowIso, end: null, error: r.error });
+      alerts.push({ kind: 'down', svc, r });
+    } else if (!isDown && prevDown) {
+      const open = state.incidents.find(x => x.service === svc.id && !x.end);
+      if (open) open.end = nowIso;
+      alerts.push({ kind: 'up', svc, r, downFor: now - new Date(prev.since) });
+    }
+
+    const recent = [...(prev.recent || []), [Math.floor(now / 1000), r.ms, r.s]].slice(-RECENT_MAX);
+    const daily = { ...prev.daily };
+    const d = daily[today] || { n: 0, up: 0, deg: 0, ms: 0 };
+    d.n++; d.ms += r.ms;
+    if (r.s === UP) d.up++;
+    if (r.s === DEGRADED) d.deg++;
+    daily[today] = d;
+    const cutoff = new Date(now - DAILY_DAYS * 864e5).toISOString().slice(0, 10);
+    for (const k of Object.keys(daily)) if (k < cutoff) delete daily[k];
+
+    state.services[svc.id] = {
+      name: svc.name, group: svc.group, status,
+      since: prev.status === status ? prev.since : nowIso,
+      lastMs: r.ms, lastCode: r.code, lastError: r.error,
+      recent, daily,
+    };
+    console.log(`${svc.name.padEnd(10)} ${status.padEnd(9)} ${String(r.ms).padStart(5)}ms ${r.error || ''}`);
+  });
+
+  // Drop services that were removed from the list.
+  for (const id of Object.keys(state.services)) if (!SERVICES.some(s => s.id === id)) delete state.services[id];
+  state.incidents = state.incidents.slice(0, INCIDENTS_MAX);
+  state.updatedAt = nowIso;
+  state.intervalMinutes = 5;
+  state.siteUrl = SITE_URL;
+  await writeFile(STATE_FILE, JSON.stringify(state));
+
+  const downs = alerts.filter(a => a.kind === 'down');
+  const ups = alerts.filter(a => a.kind === 'up');
+  if (downs.length) {
+    // Every Supabase check failing at once usually means the project is paused (free plan, a week unused).
+    const sbChecks = SERVICES.map((s, i) => [s, results[i]]).filter(([s]) => s.supabase);
+    const allSupabaseDown = sbChecks.length > 0 && sbChecks.every(([, r]) => r.s === DOWN);
+    const hint = allSupabaseDown && downs.some(a => a.svc.supabase)
+      ? '\nIf this lasts, the Supabase project may be paused: open supabase.com and click Restore.'
+      : '';
+    await notify({
+      title: downs.length === 1 ? `LAD ${downs[0].svc.name} is down` : `${downs.length} LAD services are down`,
+      message: downs.map(a => `${a.svc.name}: ${a.r.error}`).join('\n') + hint,
+      priority: 5, tags: ['rotating_light'],
+    });
+  }
+  if (ups.length) {
+    await notify({
+      title: ups.length === 1 ? `LAD ${ups[0].svc.name} is back up` : `${ups.length} LAD services recovered`,
+      message: ups.map(a => `${a.svc.name} recovered after ${fmtDuration(a.downFor)} (${a.r.ms}ms)`).join('\n'),
+      priority: 3, tags: ['white_check_mark'],
+    });
+  }
+}
+
+main().catch(e => { console.error(e); process.exit(1); });
