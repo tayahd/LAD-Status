@@ -38,3 +38,8 @@ SITE_URL=... SUPABASE_URL=... SUPABASE_PUBLISHABLE_KEY=... node monitor.mjs   # 
 NTFY_TOPIC=... node monitor.mjs --test-notify
 python3 -m http.server                                                        # dashboard reads ./status.json locally
 ```
+
+## New checks (server functions, schedules, storage, outside services)
+1. In the LAD project: run `supabase/0008_heartbeat.sql`, create the `health` function (JWT verification off), and update `send-reminders`.
+2. In this repository: Settings, Secrets and variables, Actions, New repository secret: `LAD_CRON_SECRET` = the same value as `CRON_SECRET` in Supabase. Without it, the TMDB, Unsplash and AirLabs checks are skipped (everything else still runs).
+3. Outside services are checked less often to save their allowances: TMDB and Unsplash every 30 minutes, AirLabs every 6 hours.

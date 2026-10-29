@@ -41,6 +41,7 @@ jobs:
           SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
           VERCEL_BYPASS: ${{ secrets.VERCEL_BYPASS }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          LAD_CRON_SECRET: ${{ secrets.LAD_CRON_SECRET }}
           DASHBOARD_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
         run: node monitor.mjs ${{ inputs.test_notification && '--test-notify' || '' }}
 

@@ -28,6 +28,12 @@ const BYPASS = (env.VERCEL_BYPASS || '').trim();
 const NTFY_SERVER = (env.NTFY_SERVER || 'https://ntfy.sh').replace(/\/$/, '');
 const NTFY_TOPIC = env.NTFY_TOPIC || '';
 const DASHBOARD_URL = env.DASHBOARD_URL || '';
+const CRON_SECRET = (env.LAD_CRON_SECRET || '').trim(); // same value as CRON_SECRET in Supabase; enables the outside-service checks
+const NOW = new Date();
+// Outside services each use a little of a monthly allowance, so they are checked less often:
+// TMDB and Unsplash every 30 minutes, AirLabs every 6 hours (its free plan allows about 1,000 calls a month).
+const DUE_HALF_HOUR = NOW.getUTCMinutes() % 30 < 5;
+const DUE_SIX_HOURS = NOW.getUTCHours() % 6 === 0 && NOW.getUTCMinutes() < 5;
 
 const TIMEOUT_MS = 15000;
 const SLOW_MS = 4000;         // ok but slower than this = degraded
@@ -66,7 +72,60 @@ const SERVICES = [
       return `HTTP ${res.status}`;
     },
   },
+  // Server functions: anything but "not found" or a crash means the function is deployed and starting.
+  ...(SB ? ['send-reminders', 'apple-calendar-sync', 'flight-lookup', 'media-search', 'places', 'widget', 'health'] : []).map((fn) => ({
+    id: `fn-${fn}`, name: fn, group: 'Server functions', url: `${SB}/functions/v1/${fn}`, headers: sbHeaders,
+    validate: (res, body) => {
+      if (res.status === 404 || /NOT_FOUND|Requested function was not found/i.test(body)) return `Not deployed. Create the ${fn} function in Supabase`
+      if (res.status >= 500 || /BOOT_ERROR|WORKER_LIMIT/i.test(body)) return `Crashed (HTTP ${res.status}). Check its Logs in Supabase`
+      return null
+    },
+  })),
+  // Scheduled jobs: did they actually run recently? (The health function reports when they last ran.)
+  SB && {
+    id: 'sched-reminders', name: 'Reminders schedule', group: 'Schedules', url: `${SB}/functions/v1/health`, headers: sbHeaders,
+    validate: (res, body) => scheduleCheck(res, body, (d) => d.reminders, 3, 'The every-minute reminders job has not run. Check Integrations, Cron in Supabase'),
+  },
+  SB && {
+    id: 'sched-apple', name: 'Apple Calendar sync', group: 'Schedules', url: `${SB}/functions/v1/health`, headers: sbHeaders,
+    validate: (res, body) => {
+      let d; try { d = JSON.parse(body) } catch { return `Health check unreadable (HTTP ${res.status})` }
+      if (!d.apple) return null // Apple sync is not set up; nothing to watch
+      if (d.apple.ok === false) return 'The last Apple sync failed. Open LAD, Settings, Apple Calendar for the reason'
+      return scheduleCheck(res, body, (x) => x.apple.lastRun, 15, 'Apple sync has not run in 15 minutes. Check the lad-apple-calendar job in Supabase Cron')
+    },
+  },
+  SB && {
+    id: 'storage', name: 'Photo storage', group: 'Supabase Storage', url: `${SB}/functions/v1/health`, headers: sbHeaders,
+    validate: (res, body) => { let d; try { d = JSON.parse(body) } catch { return `Health check unreadable (HTTP ${res.status})` } return d.storage?.ok ? null : `Photo storage problem: ${d.storage?.error ?? 'unknown'}. Run supabase/0005_photos.sql` },
+  },
+  // Outside services LAD borrows data from.
+  {
+    id: 'ext-weather', name: 'Weather (Open-Meteo)', group: 'Outside services', url: 'https://api.open-meteo.com/v1/forecast?latitude=41.88&longitude=-87.63&current=temperature_2m',
+    validate: (res, body) => (res.ok && body.includes('temperature_2m') ? null : `HTTP ${res.status}`),
+  },
+  ...[['tmdb', 'Posters (TMDB)', DUE_HALF_HOUR], ['unsplash', 'Trip photos (Unsplash)', DUE_HALF_HOUR], ['airlabs', 'Flights (AirLabs)', DUE_SIX_HOURS]]
+    .filter(([, , due]) => SB && CRON_SECRET && due)
+    .map(([key, name]) => ({
+      id: `ext-${key}`, name, group: 'Outside services', url: `${SB}/functions/v1/health?check=${key}`, headers: { ...sbHeaders, 'x-cron-secret': CRON_SECRET },
+      validate: (res, body) => {
+        let d; try { d = JSON.parse(body) } catch { return `Health check unreadable (HTTP ${res.status})` }
+        if (d.error) return d.error
+        const r = d.services?.[key]
+        return r?.ok ? null : (r?.error ?? 'No answer')
+      },
+    })),
 ].filter(Boolean);
+
+/** Reads a "last ran at" time from the health answer and fails if it is older than `maxMinutes`. */
+function scheduleCheck(res, body, pick, maxMinutes, message) {
+  let d; try { d = JSON.parse(body) } catch { return `Health check unreadable (HTTP ${res.status}). Is the health function deployed?` }
+  if (res.status === 404) return 'The health function is not deployed'
+  let at; try { at = pick(d) } catch { at = null }
+  if (!at) return `${message} (never ran)`
+  const age = (Date.now() - Date.parse(at)) / 60000
+  return age > maxMinutes ? `${message} (last ran ${Math.round(age)} min ago)` : null
+}
 
 const UP = 0, DEGRADED = 1, DOWN = 2;
 const LABEL = ['up', 'degraded', 'down'];
