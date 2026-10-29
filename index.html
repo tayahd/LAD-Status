@@ -229,6 +229,38 @@
 
   .loading .svc, .loading .kpi, .loading .hero { opacity: .5; }
   .skeleton { height: 140px; border-radius: var(--radius); background: var(--surface-2); }
+
+  /* Sections: each group of services folds; problems open automatically. */
+  .sgroup, .hgroup { border: 1px solid var(--line, rgba(255,255,255,.08)); border-radius: 18px; background: var(--card, rgba(255,255,255,.02)); margin-bottom: 12px; overflow: hidden; }
+  .sgroup > summary, .hgroup > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 10px; padding: 14px 16px; }
+  .sgroup > summary::-webkit-details-marker, .hgroup > summary::-webkit-details-marker { display: none; }
+  .sg-title { font-weight: 650; font-size: 15px; }
+  .sg-blurb { color: var(--faint); font-size: 12.5px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hgroup .sg-count { margin-left: auto; }
+  .sg-count { font-size: 12px; font-weight: 600; padding: 3px 9px; border-radius: 999px; background: rgba(127,127,127,.12); }
+  .sg-count.up { color: var(--up); } .sg-count.down { color: var(--down); } .sg-count.degraded { color: var(--deg); }
+  .sg-chev { color: var(--faint); transition: transform .15s; font-size: 18px; }
+  details[open] > summary .sg-chev { transform: rotate(90deg); }
+  .sgroup.down { border-color: color-mix(in srgb, var(--down) 45%, transparent); }
+  .sgroup > .services { padding: 0 12px 12px; display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; background: var(--up); box-shadow: 0 0 0 4px color-mix(in srgb, var(--up) 18%, transparent); }
+  .dot.down { background: var(--down); box-shadow: 0 0 0 4px color-mix(in srgb, var(--down) 18%, transparent); }
+  .dot.degraded { background: var(--deg); box-shadow: 0 0 0 4px color-mix(in srgb, var(--deg) 18%, transparent); }
+  .srows { display: flex; flex-direction: column; padding: 0 8px 8px; }
+  .srow { display: grid; grid-template-columns: auto minmax(0, 1.6fr) minmax(0, 1fr) 64px 70px 92px; gap: 12px; align-items: center; padding: 10px 10px; border-radius: 12px; }
+  .srow + .srow { border-top: 1px solid var(--line, rgba(255,255,255,.06)); }
+  .srow:hover { background: rgba(127,127,127,.06); }
+  .srow-name { display: flex; flex-direction: column; min-width: 0; }
+  .srow-name b { font-weight: 600; font-size: 14px; }
+  .srow-sub { color: var(--faint); font-size: 12px; }
+  .srow-err { color: var(--down); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .srow-spark svg { width: 100%; height: 26px; display: block; }
+  .srow-num { display: flex; align-items: baseline; gap: 3px; font-variant-numeric: tabular-nums; }
+  .srow-num b { font-size: 14px; } .srow-num span { color: var(--faint); font-size: 11px; }
+  .srow .pill { justify-self: end; }
+  .hgroup .h-row { padding: 6px 16px; }
+  .hgroup .h-axis { padding: 0 16px 14px; }
+  @media (max-width: 720px) { .srow { grid-template-columns: auto minmax(0, 1fr) auto; } .srow-spark, .srow-num { display: none; } .sg-blurb { display: none; } }
 </style>
 </head>
 <body>
@@ -262,7 +294,7 @@
 
   <section>
     <h2>Services <span id="svc-note">Last 24 hours</span></h2>
-    <div class="services" id="services"><div class="skeleton"></div><div class="skeleton"></div></div>
+    <div id="services"><div class="skeleton"></div></div>
   </section>
 
   <section>
@@ -452,15 +484,22 @@
       ['Last incident', last ? ago(last.end || last.start).replace(/^in /, '') : 'None', last ? `${last.name}${last.end ? '' : ' · ongoing'}` : 'Clean record'],
     ].map(([l, v, s]) => `<div class="kpi"><div class="label">${l}</div><div class="value">${v}</div><div class="sub">${esc(s)}</div></div>`).join('');
 
-    // Services
-    $('services').innerHTML = svcs.map(s => {
-      const r = s.recent || [];
-      const first = r[0] ? timeFmt.format(new Date(r[0][0] * 1000)) : '';
+    // Services, organized into sections. Sections with a problem open automatically.
+    const SECTIONS = [
+      ['core', 'Core app', 'The website, sign-in and your database', (s) => ['web', 'auth', 'db'].includes(s.id)],
+      ['fn', 'Server functions', 'Small programs on Supabase that do work for LAD', (s) => s.id.startsWith('fn-')],
+      ['jobs', 'Scheduled jobs and storage', 'Reminders, Apple Calendar sync and photo storage', (s) => s.id.startsWith('sched-') || s.id === 'storage'],
+      ['ext', 'Outside services', 'Companies LAD borrows data from', (s) => s.id.startsWith('ext-')],
+    ]
+    const placed = new Set()
+    const groups = SECTIONS.map(([key, title, blurb, test]) => { const list = svcs.filter((s) => test(s) && !placed.has(s.id)); list.forEach((s) => placed.add(s.id)); return { key, title, blurb, list } })
+    const rest = svcs.filter((s) => !placed.has(s.id)); if (rest.length) groups.push({ key: 'other', title: 'Other', blurb: '', list: rest })
+    const label = (st) => st === 'up' ? 'Operational' : st === 'degraded' ? 'Slow' : 'Down'
+    const card = (s) => {
+      const r = s.recent || []
+      const first = r[0] ? timeFmt.format(new Date(r[0][0] * 1000)) : ''
       return `<div class="svc">
-        <div class="svc-head">
-          <div><div class="svc-name">${esc(s.name)}</div><div class="svc-group">${esc(s.group)}</div></div>
-          <span class="pill ${s.status}">${s.status === 'up' ? 'Operational' : s.status === 'degraded' ? 'Slow' : 'Down'}</span>
-        </div>
+        <div class="svc-head"><div><div class="svc-name">${esc(s.name)}</div><div class="svc-group">${esc(s.group)}</div></div><span class="pill ${s.status}">${label(s.status)}</span></div>
         <div class="svc-metrics">
           <div class="metric"><div class="m-val">${s.lastMs ?? '—'}ms</div><div class="m-lbl">Now</div></div>
           <div class="metric"><div class="m-val">${avg24(s) ?? '—'}ms</div><div class="m-lbl">Avg 24h</div></div>
@@ -470,12 +509,33 @@
         ${sparkline(s)}
         <div class="spark-axis"><span>${first}</span><span>${s.status === 'up' ? 'up' : s.status} for ${dur(Date.now() - new Date(s.since))}</span><span>now</span></div>
         ${s.status === 'down' && s.lastError ? `<div class="svc-error">${esc(s.lastError)}</div>` : ''}
-      </div>`;
-    }).join('') || '<div class="empty">No services reported yet.</div>';
+      </div>`
+    }
+    const row = (s) => `<div class="srow ${s.status}">
+        <span class="dot ${s.status}"></span>
+        <div class="srow-name"><b>${esc(s.name)}</b>${s.status === 'down' && s.lastError ? `<span class="srow-err">${esc(s.lastError)}</span>` : `<span class="srow-sub">${s.status === 'up' ? 'up' : s.status} for ${dur(Date.now() - new Date(s.since))}</span>`}</div>
+        <div class="srow-spark">${sparkline(s)}</div>
+        <div class="srow-num"><b>${s.lastMs ?? '—'}</b><span>ms</span></div>
+        <div class="srow-num"><b>${pct(uptime24(s))}</b><span>% 24h</span></div>
+        <span class="pill ${s.status}">${label(s.status)}</span>
+      </div>`
+    $('services').innerHTML = groups.filter((g) => g.list.length).map((g) => {
+      const bad = g.list.filter((s) => s.status !== 'up').length
+      const state = g.list.some((s) => s.status === 'down') ? 'down' : bad ? 'degraded' : 'up'
+      return `<details class="sgroup ${state}" ${bad || g.key === 'core' ? 'open' : ''}>
+        <summary><span class="dot ${state}"></span><span class="sg-title">${g.title}</span><span class="sg-blurb">${esc(g.blurb)}</span><span class="sg-count ${state}">${g.list.length - bad}/${g.list.length} up</span><span class="sg-chev">›</span></summary>
+        ${g.key === 'core' ? `<div class="services">${g.list.map(card).join('')}</div>` : `<div class="srows">${g.list.map(row).join('')}</div>`}
+      </details>`
+    }).join('') || '<div class="empty">No services reported yet.</div>'
+    // When everything on Supabase fails the same way, say so once at the top.
+    const sbDown = svcs.filter((s) => s.id !== 'web' && !s.id.startsWith('ext-weather') && s.status === 'down')
+    const common = sbDown.length > 3 && sbDown.every((s) => s.lastError === sbDown[0].lastError) ? sbDown[0].lastError : ''
+    $('svc-note').textContent = common ? '' : 'Last 24 hours'
+    if (common) $('subline').textContent = `${sbDown.length} services share one cause: ${common}`
 
-    // 90-day history
+    // 90-day history, in the same sections.
     const days = [...Array(90)].map((_, i) => new Date(Date.now() - (89 - i) * 864e5));
-    $('history').innerHTML = svcs.map(s => {
+    const hrow = (s) => {
       const bars = days.map(d => {
         const k = dayKey(d), x = s.daily?.[k];
         let cls = '', up = null;
@@ -488,9 +548,9 @@
       return `<div class="h-row">
         <div class="h-top"><b>${esc(s.name)}</b><span>${pct(uptimeDays(s, 90))}% uptime</span></div>
         <div class="bars">${bars}</div>
-        <div class="h-axis"><span class="ninety">90 days ago</span><span class="fortyfive">45 days ago</span><span>Today</span></div>
       </div>`;
-    }).join('');
+    }
+    $('history').innerHTML = groups.filter((g) => g.list.length).map((g) => `<details class="hgroup" ${g.key === 'core' ? 'open' : ''}><summary><span class="sg-title">${g.title}</span><span class="sg-count">${pct(Math.min(...g.list.map((s) => uptimeDays(s, 90) ?? 100)))}% lowest</span><span class="sg-chev">›</span></summary>${g.list.map(hrow).join('')}<div class="h-axis"><span class="ninety">90 days ago</span><span class="fortyfive">45 days ago</span><span>Today</span></div></details>`).join('');
 
     // Incidents
     const inc = data.incidents || [];

@@ -146,7 +146,13 @@ async function probe(svc) {
     return { s: ms > SLOW_MS ? DEGRADED : UP, ms, code: res.status, error: null };
   } catch (e) {
     const ms = Math.round(performance.now() - started);
-    const error = e.name === 'TimeoutError' ? `Timed out after ${TIMEOUT_MS / 1000}s` : (e.cause?.code || e.message);
+    const code = e.cause?.code || ''
+    // Plain-English versions of the network errors you are most likely to see.
+    const error = e.name === 'TimeoutError' ? `Timed out after ${TIMEOUT_MS / 1000}s`
+      : code === 'EAI_AGAIN' || code === 'ENOTFOUND' ? `Can't find ${new URL(svc.url).host}. Check the address (SUPABASE_URL or SITE_URL in GitHub)`
+      : code === 'ECONNREFUSED' ? 'Connection refused'
+      : code === 'CERT_HAS_EXPIRED' ? 'Security certificate expired'
+      : (code || e.message);
     return { s: DOWN, ms, code: 0, error };
   }
 }
