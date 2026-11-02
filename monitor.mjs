@@ -83,26 +83,26 @@ const SERVICES = [
   })),
   // Scheduled jobs: did they actually run recently? (The health function reports when they last ran.)
   SB && {
-    id: 'sched-reminders', name: 'Reminders schedule', group: 'Schedules', url: `${SB}/functions/v1/health`, headers: sbHeaders,
+    id: 'sched-reminders', name: 'Reminders schedule', group: 'Schedules', url: `${SB}/functions/v1/health`, headers: {},
     validate: (res, body) => scheduleCheck(res, body, (d) => d.reminders, 3, 'The every-minute reminders job has not run. Check Integrations, Cron in Supabase'),
   },
   SB && {
-    id: 'sched-apple', name: 'Apple Calendar sync', group: 'Schedules', url: `${SB}/functions/v1/health`, headers: sbHeaders,
+    id: 'sched-apple', name: 'Apple Calendar sync', group: 'Schedules', url: `${SB}/functions/v1/health`, headers: {},
     validate: (res, body) => {
       const hp = healthProblem(res, body); if (hp) return hp
       let d; try { d = JSON.parse(body) } catch { return `Health check unreadable (HTTP ${res.status})` }
-      if (!('apple' in d)) return 'The health function is an older version. Update it from supabase/functions/health/index.ts'
+      if (!('apple' in d)) return snippet(res, body)
       if (!d.apple) return null // Apple sync is not set up; nothing to watch
       if (d.apple.ok === false) return 'The last Apple sync failed. Open LAD, Settings, Apple Calendar for the reason'
       return scheduleCheck(res, body, (x) => x.apple.lastRun, 15, 'Apple sync has not run in 15 minutes. Check the lad-apple-calendar job in Supabase Cron')
     },
   },
   SB && {
-    id: 'storage', name: 'Photo storage', group: 'Supabase Storage', url: `${SB}/functions/v1/health`, headers: sbHeaders,
+    id: 'storage', name: 'Photo storage', group: 'Supabase Storage', url: `${SB}/functions/v1/health`, headers: {},
     validate: (res, body) => {
       const hp = healthProblem(res, body); if (hp) return hp
       let d; try { d = JSON.parse(body) } catch { return `Health check unreadable (HTTP ${res.status})` }
-      if (!d.storage) return 'The health function is an older version. Update it from supabase/functions/health/index.ts'
+      if (!d.storage) return snippet(res, body)
       return d.storage.ok ? null : `Photo storage problem: ${d.storage.error ?? 'unknown'}. Run supabase/0005_photos.sql`
     },
   },
@@ -114,19 +114,22 @@ const SERVICES = [
   ...[['tmdb', 'Posters (TMDB)', DUE_HALF_HOUR], ['unsplash', 'Trip photos (Unsplash)', DUE_HALF_HOUR], ['airlabs', 'Flights (AirLabs)', DUE_SIX_HOURS]]
     .filter(([, , due]) => SB && CRON_SECRET && due)
     .map(([key, name]) => ({
-      id: `ext-${key}`, name, group: 'Outside services', url: `${SB}/functions/v1/health?check=${key}`, headers: { ...sbHeaders, 'x-cron-secret': CRON_SECRET },
+      id: `ext-${key}`, name, group: 'Outside services', url: `${SB}/functions/v1/health?check=${key}`, headers: { 'x-cron-secret': CRON_SECRET },
       validate: (res, body) => {
         const hp = healthProblem(res, body); if (hp && !/x-cron-secret/.test(body)) return hp
         let d; try { d = JSON.parse(body) } catch { return `Health check unreadable (HTTP ${res.status})` }
         if (d.error) return /x-cron-secret/.test(d.error) ? 'LAD_CRON_SECRET in GitHub does not match CRON_SECRET in Supabase' : d.error
         const r = d.services?.[key]
-        return r?.ok ? null : (r?.error ?? 'The health function did not test this service. Update it from supabase/functions/health/index.ts')
+        return r?.ok ? null : (r?.error ?? snippet(res, body))
       },
     })),
 ].filter(Boolean);
 
 /** Reads a "last ran at" time from the health answer and fails if it is older than `maxMinutes`. */
 /** Problems with the health function itself, before reading what it reports. */
+/** The first part of an unexpected answer, so the dashboard shows what really came back. */
+const snippet = (res, body) => `Unexpected answer (HTTP ${res.status}): ${String(body).replace(/\s+/g, ' ').slice(0, 140)}`
+
 function healthProblem(res, body) {
   if (res.status === 404) return 'The health function is not deployed. Create it in Supabase (Edge Functions)'
   if (res.status === 401 && /JWT|authorization/i.test(body)) return 'The health function has JWT verification on. Turn it off: Edge Functions, health, Details'
@@ -138,7 +141,7 @@ function scheduleCheck(res, body, pick, maxMinutes, message) {
   const hp = healthProblem(res, body); if (hp) return hp
   let d; try { d = JSON.parse(body) } catch { return `Health check unreadable (HTTP ${res.status}). Is the health function deployed?` }
   let at; try { at = pick(d) } catch { at = null }
-  if (!at) return `${message} (never ran)`
+  if (!at) return 'reminders' in d ? `${message} (never ran)` : snippet(res, body)
   const age = (Date.now() - Date.parse(at)) / 60000
   return age > maxMinutes ? `${message} (last ran ${Math.round(age)} min ago)` : null
 }
