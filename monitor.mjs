@@ -89,7 +89,9 @@ const SERVICES = [
   SB && {
     id: 'sched-apple', name: 'Apple Calendar sync', group: 'Schedules', url: `${SB}/functions/v1/health`, headers: sbHeaders,
     validate: (res, body) => {
+      const hp = healthProblem(res, body); if (hp) return hp
       let d; try { d = JSON.parse(body) } catch { return `Health check unreadable (HTTP ${res.status})` }
+      if (!('apple' in d)) return 'The health function is an older version. Update it from supabase/functions/health/index.ts'
       if (!d.apple) return null // Apple sync is not set up; nothing to watch
       if (d.apple.ok === false) return 'The last Apple sync failed. Open LAD, Settings, Apple Calendar for the reason'
       return scheduleCheck(res, body, (x) => x.apple.lastRun, 15, 'Apple sync has not run in 15 minutes. Check the lad-apple-calendar job in Supabase Cron')
@@ -97,7 +99,12 @@ const SERVICES = [
   },
   SB && {
     id: 'storage', name: 'Photo storage', group: 'Supabase Storage', url: `${SB}/functions/v1/health`, headers: sbHeaders,
-    validate: (res, body) => { let d; try { d = JSON.parse(body) } catch { return `Health check unreadable (HTTP ${res.status})` } return d.storage?.ok ? null : `Photo storage problem: ${d.storage?.error ?? 'unknown'}. Run supabase/0005_photos.sql` },
+    validate: (res, body) => {
+      const hp = healthProblem(res, body); if (hp) return hp
+      let d; try { d = JSON.parse(body) } catch { return `Health check unreadable (HTTP ${res.status})` }
+      if (!d.storage) return 'The health function is an older version. Update it from supabase/functions/health/index.ts'
+      return d.storage.ok ? null : `Photo storage problem: ${d.storage.error ?? 'unknown'}. Run supabase/0005_photos.sql`
+    },
   },
   // Outside services LAD borrows data from.
   {
@@ -109,18 +116,27 @@ const SERVICES = [
     .map(([key, name]) => ({
       id: `ext-${key}`, name, group: 'Outside services', url: `${SB}/functions/v1/health?check=${key}`, headers: { ...sbHeaders, 'x-cron-secret': CRON_SECRET },
       validate: (res, body) => {
+        const hp = healthProblem(res, body); if (hp && !/x-cron-secret/.test(body)) return hp
         let d; try { d = JSON.parse(body) } catch { return `Health check unreadable (HTTP ${res.status})` }
-        if (d.error) return d.error
+        if (d.error) return /x-cron-secret/.test(d.error) ? 'LAD_CRON_SECRET in GitHub does not match CRON_SECRET in Supabase' : d.error
         const r = d.services?.[key]
-        return r?.ok ? null : (r?.error ?? 'No answer')
+        return r?.ok ? null : (r?.error ?? 'The health function did not test this service. Update it from supabase/functions/health/index.ts')
       },
     })),
 ].filter(Boolean);
 
 /** Reads a "last ran at" time from the health answer and fails if it is older than `maxMinutes`. */
+/** Problems with the health function itself, before reading what it reports. */
+function healthProblem(res, body) {
+  if (res.status === 404) return 'The health function is not deployed. Create it in Supabase (Edge Functions)'
+  if (res.status === 401 && /JWT|authorization/i.test(body)) return 'The health function has JWT verification on. Turn it off: Edge Functions, health, Details'
+  if (res.status >= 500) return `The health function crashed (HTTP ${res.status}). Check its Logs in Supabase`
+  return null
+}
+
 function scheduleCheck(res, body, pick, maxMinutes, message) {
+  const hp = healthProblem(res, body); if (hp) return hp
   let d; try { d = JSON.parse(body) } catch { return `Health check unreadable (HTTP ${res.status}). Is the health function deployed?` }
-  if (res.status === 404) return 'The health function is not deployed'
   let at; try { at = pick(d) } catch { at = null }
   if (!at) return `${message} (never ran)`
   const age = (Date.now() - Date.parse(at)) / 60000
@@ -173,8 +189,17 @@ function fmtDuration(ms) {
 }
 
 async function notify({ title, message, priority = 3, tags = [] }) {
+  // 1. Straight to your phone through LAD's own notifications (the LAD app on your Home Screen),
+  //    using the same push setup as your reminders. Needs SUPABASE_URL and LAD_CRON_SECRET.
+  if (SB && CRON_SECRET) {
+    try {
+      const r = await fetch(`${SB}/functions/v1/send-reminders`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-cron-secret': CRON_SECRET }, body: JSON.stringify({ alert: { title, body: message, url: DASHBOARD_URL || '/' } }), signal: AbortSignal.timeout(TIMEOUT_MS) });
+      console.log(r.ok ? `LAD push sent: ${title}` : `LAD push failed: HTTP ${r.status} ${await r.text()}`);
+    } catch (e) { console.error(`LAD push failed: ${e.message}`) }
+  }
+  // 2. Also through ntfy, if you set NTFY_TOPIC (optional).
   if (!NTFY_TOPIC) {
-    console.log(`[no NTFY_TOPIC] would push: ${title} — ${message}`);
+    console.log(`[no NTFY_TOPIC] skipped ntfy: ${title}`);
     return;
   }
   const res = await fetch(NTFY_SERVER, {
@@ -221,9 +246,14 @@ async function main() {
     const isDown = r.s === DOWN;
     const status = LABEL[r.s];
 
-    if (isDown && !prevDown) {
+    if (isDown && !prevDown && !state.incidents.some(x => x.service === svc.id && !x.end)) {
       state.incidents.unshift({ service: svc.id, name: svc.name, start: nowIso, end: null, error: r.error });
       alerts.push({ kind: 'down', svc, r });
+    } else if (isDown && prevDown) {
+      // Still down: show the latest reason, which can change as things get fixed.
+      const open = state.incidents.find(x => x.service === svc.id && !x.end);
+      if (open && r.error) open.error = r.error;
+      if (open && now - new Date(open.reminded || open.start) > 3 * 3600e3) { open.reminded = nowIso; alerts.push({ kind: 'still', svc, r, downFor: now - new Date(open.start) }) }
     } else if (!isDown && prevDown) {
       const open = state.incidents.find(x => x.service === svc.id && !x.end);
       if (open) open.end = nowIso;
@@ -250,7 +280,10 @@ async function main() {
   });
 
   // Drop services that were removed from the list.
-  for (const id of Object.keys(state.services)) if (!SERVICES.some(s => s.id === id)) delete state.services[id];
+  for (const id of Object.keys(state.services)) if (!SERVICES.some(s => s.id === id) && !id.startsWith('ext-')) delete state.services[id];
+  // One open incident per service: merge duplicates left by older versions.
+  const seenOpen = new Set();
+  state.incidents = state.incidents.filter((x) => { if (x.end) return true; if (seenOpen.has(x.service)) return false; seenOpen.add(x.service); return true });
   state.incidents = state.incidents.slice(0, INCIDENTS_MAX);
   state.updatedAt = nowIso;
   state.intervalMinutes = 5;
@@ -270,6 +303,14 @@ async function main() {
       title: downs.length === 1 ? `LAD ${downs[0].svc.name} is down` : `${downs.length} LAD services are down`,
       message: downs.map(a => `${a.svc.name}: ${a.r.error}`).join('\n') + hint,
       priority: 5, tags: ['rotating_light'],
+    });
+  }
+  const still = alerts.filter(a => a.kind === 'still');
+  if (still.length) {
+    await notify({
+      title: still.length === 1 ? `LAD ${still[0].svc.name} is still down` : `${still.length} LAD services are still down`,
+      message: still.map(a => `${a.svc.name} (${fmtDuration(a.downFor)}): ${a.r.error}`).join('\n'),
+      priority: 4, tags: ['warning'],
     });
   }
   if (ups.length) {
