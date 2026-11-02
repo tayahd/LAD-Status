@@ -22,7 +22,8 @@ import { readFile, writeFile } from 'node:fs/promises';
 const env = process.env;
 const STATE_FILE = env.STATE_FILE || './status.json';
 const SITE_URL = (env.SITE_URL || '').trim();
-const SB = (env.SUPABASE_URL || '').trim().replace(/\/$/, '');
+// Only the project address counts, even if a path like /rest/v1 was pasted after it.
+const SB = (env.SUPABASE_URL || '').trim().replace(/(\.supabase\.co)\/.*$/, '$1').replace(/\/$/, '');
 const KEY = (env.SUPABASE_PUBLISHABLE_KEY || env.SUPABASE_ANON_KEY || '').trim();
 const BYPASS = (env.VERCEL_BYPASS || '').trim();
 const NTFY_SERVER = (env.NTFY_SERVER || 'https://ntfy.sh').replace(/\/$/, '');
@@ -45,6 +46,7 @@ const INCIDENTS_MAX = 100;
 // New Supabase keys (sb_publishable_...) go in the apikey header only; older JWT anon keys also go in Authorization.
 const sbHeaders = !KEY ? {} : KEY.startsWith('eyJ') ? { apikey: KEY, Authorization: `Bearer ${KEY}` } : { apikey: KEY };
 
+const healthHeaders = KEY ? { apikey: KEY } : {};
 const SERVICES = [
   SITE_URL && {
     id: 'web', name: 'Website', group: 'Vercel', url: SITE_URL, redirect: 'manual',
@@ -83,11 +85,11 @@ const SERVICES = [
   })),
   // Scheduled jobs: did they actually run recently? (The health function reports when they last ran.)
   SB && {
-    id: 'sched-reminders', name: 'Reminders schedule', group: 'Schedules', url: `${SB}/functions/v1/health`, headers: {},
+    id: 'sched-reminders', name: 'Reminders schedule', group: 'Schedules', url: `${SB}/functions/v1/health`, headers: healthHeaders,
     validate: (res, body) => scheduleCheck(res, body, (d) => d.reminders, 3, 'The every-minute reminders job has not run. Check Integrations, Cron in Supabase'),
   },
   SB && {
-    id: 'sched-apple', name: 'Apple Calendar sync', group: 'Schedules', url: `${SB}/functions/v1/health`, headers: {},
+    id: 'sched-apple', name: 'Apple Calendar sync', group: 'Schedules', url: `${SB}/functions/v1/health`, headers: healthHeaders,
     validate: (res, body) => {
       const hp = healthProblem(res, body); if (hp) return hp
       let d; try { d = JSON.parse(body) } catch { return `Health check unreadable (HTTP ${res.status})` }
@@ -98,7 +100,7 @@ const SERVICES = [
     },
   },
   SB && {
-    id: 'storage', name: 'Photo storage', group: 'Supabase Storage', url: `${SB}/functions/v1/health`, headers: {},
+    id: 'storage', name: 'Photo storage', group: 'Supabase Storage', url: `${SB}/functions/v1/health`, headers: healthHeaders,
     validate: (res, body) => {
       const hp = healthProblem(res, body); if (hp) return hp
       let d; try { d = JSON.parse(body) } catch { return `Health check unreadable (HTTP ${res.status})` }
@@ -114,7 +116,7 @@ const SERVICES = [
   ...[['tmdb', 'Posters (TMDB)', DUE_HALF_HOUR], ['unsplash', 'Trip photos (Unsplash)', DUE_HALF_HOUR], ['airlabs', 'Flights (AirLabs)', DUE_SIX_HOURS]]
     .filter(([, , due]) => SB && CRON_SECRET && due)
     .map(([key, name]) => ({
-      id: `ext-${key}`, name, group: 'Outside services', url: `${SB}/functions/v1/health?check=${key}`, headers: { 'x-cron-secret': CRON_SECRET },
+      id: `ext-${key}`, name, group: 'Outside services', url: `${SB}/functions/v1/health?check=${key}`, headers: { ...healthHeaders, 'x-cron-secret': CRON_SECRET },
       validate: (res, body) => {
         const hp = healthProblem(res, body); if (hp && !/x-cron-secret/.test(body)) return hp
         let d; try { d = JSON.parse(body) } catch { return `Health check unreadable (HTTP ${res.status})` }
